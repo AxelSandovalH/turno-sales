@@ -1,29 +1,39 @@
 """
-Turno Sales — Google Maps Scraper
-Uso: python scraper.py --niche barbershop --city "Ciudad de México" --limit 50
+Turno Sales — Scraper de leads via Google Places API (Text Search)
+
+Uso:
+  python scraper.py --niche barbershop --city "Ciudad de México" --limit 60
+  python scraper.py --niche psychology  --city "Guadalajara"      --limit 40
+  python scraper.py --all               --city "Monterrey"        --limit 30
+
+Requiere .env con:
+  SUPABASE_URL
+  SUPABASE_SERVICE_ROLE_KEY
+  GOOGLE_PLACES_API_KEY
 """
 
 import argparse
 import math
 import os
-import re
 import time
+import requests
 from dotenv import load_dotenv
 from supabase import create_client
-from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+GOOGLE_KEY   = os.environ["GOOGLE_PLACES_API_KEY"]
 
 SEARCH_TERMS = {
-    "barbershop":    ["barbería", "barber shop", "barbero"],
-    "psychology":    ["psicólogo", "psicología", "terapeuta psicológico"],
+    "barbershop":    ["barbería", "barber shop", "peluquería"],
+    "psychology":    ["psicólogo", "consultorio psicología", "terapeuta psicológico"],
     "dentistry":     ["dentista", "clínica dental", "odontólogo"],
     "physiotherapy": ["fisioterapia", "fisioterapeuta", "rehabilitación física"],
-    "other":         ["spa", "salón de belleza", "estética"],
 }
+
+PLACES_URL = "https://maps.googleapis.com/maps/api/place"
 
 
 def score(rating: float, review_count: int) -> int:
@@ -32,140 +42,157 @@ def score(rating: float, review_count: int) -> int:
     return round(rating * math.log10(review_count + 1) * 10)
 
 
-def clean_phone(raw: str) -> str:
-    """Limpia y normaliza número de teléfono a formato internacional MX."""
-    digits = re.sub(r"\D", "", raw)
-    if digits.startswith("52") and len(digits) == 12:
-        return digits
-    if len(digits) == 10:
-        return f"52{digits}"
-    return digits
+def text_search(query: str, city: str, page_token: str = "") -> dict:
+    params = {
+        "query": f"{query} en {city}",
+        "key": GOOGLE_KEY,
+        "language": "es",
+        "region": "mx",
+    }
+    if page_token:
+        params["pagetoken"] = page_token
+    r = requests.get(f"{PLACES_URL}/textsearch/json", params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
 
-def scrape_google_maps(page, query: str, city: str, limit: int) -> list[dict]:
-    search_query = f"{query} en {city}"
-    url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
-    print(f"  Buscando: {search_query}")
+def place_details(place_id: str) -> dict:
+    params = {
+        "place_id": place_id,
+        "fields": "name,formatted_phone_number,international_phone_number,website,formatted_address",
+        "key": GOOGLE_KEY,
+        "language": "es",
+    }
+    r = requests.get(f"{PLACES_URL}/details/json", params=params, timeout=10)
+    r.raise_for_status()
+    return r.json().get("result", {})
 
-    page.goto(url, wait_until="networkidle")
-    time.sleep(2)
 
-    # Scroll para cargar más resultados
-    results_panel = page.locator('[role="feed"]')
-    for _ in range(5):
-        results_panel.evaluate("el => el.scrollBy(0, 2000)")
-        time.sleep(1.5)
-
-    # Extraer cards de resultados
-    cards = page.locator('[role="feed"] > div').all()
+def fetch_leads(query: str, city: str, niche: str, limit: int) -> list[dict]:
     leads = []
+    page_token = ""
 
-    for card in cards[:limit]:
-        try:
-            name_el = card.locator("a[aria-label]").first
-            name = name_el.get_attribute("aria-label") or ""
-            if not name:
-                continue
+    while len(leads) < limit:
+        data = text_search(query, city, page_token)
+        results = data.get("results", [])
 
-            href = name_el.get_attribute("href") or ""
-            place_id = ""
-            if "place_id=" in href:
-                place_id = href.split("place_id=")[1].split("&")[0]
-            elif "/maps/place/" in href:
-                place_id = href
+        for r in results:
+            if len(leads) >= limit:
+                break
 
-            # Rating y reseñas
-            rating_text = card.locator("span[aria-label*='estrella']").first.text_content() or ""
-            rating = float(rating_text.replace(",", ".")) if rating_text else 0.0
-            reviews_match = re.search(r"([\d,\.]+)\s*reseñas?", card.text_content() or "")
-            review_count = int(reviews_match.group(1).replace(",", "").replace(".", "")) if reviews_match else 0
+            place_id = r.get("place_id", "")
+            name     = r.get("name", "")
+            rating   = r.get("rating", 0.0)
+            reviews  = r.get("user_ratings_total", 0)
+            address  = r.get("formatted_address", "")
+            maps_url = f"https://www.google.com/maps/place/?q=place_id:{place_id}"
 
-            # Dirección
-            address_el = card.locator('[data-item-id="address"]')
-            address = address_el.text_content() if address_el.count() else ""
-
-            # Teléfono
-            phone_el = card.locator('[data-item-id*="phone"]')
-            raw_phone = phone_el.text_content() if phone_el.count() else ""
-            phone = clean_phone(raw_phone) if raw_phone else None
+            # Detalles adicionales (teléfono, website)
+            details = place_details(place_id) if place_id else {}
+            raw_phone = (
+                details.get("international_phone_number")
+                or details.get("formatted_phone_number")
+                or ""
+            )
+            phone = raw_phone.replace("+", "").replace(" ", "").replace("-", "") if raw_phone else None
+            # Normalizar a formato MX (521XXXXXXXXXX)
+            if phone and phone.startswith("52") and len(phone) == 12:
+                pass  # ya está bien
+            elif phone and len(phone) == 10:
+                phone = f"52{phone}"
 
             leads.append({
-                "business_name": name.strip(),
-                "phone": phone,
+                "business_name":   name,
+                "phone":           phone,
                 "whatsapp_number": phone,
-                "city": city,
-                "address": address.strip() if address else None,
-                "rating": round(rating, 1) if rating else None,
-                "review_count": review_count if review_count else None,
-                "google_maps_url": href if href.startswith("https") else f"https://maps.google.com{href}",
+                "city":            city,
+                "state":           None,
+                "niche":           niche,
+                "address":         address or None,
+                "website":         details.get("website") or None,
+                "rating":          round(float(rating), 1) if rating else None,
+                "review_count":    int(reviews) if reviews else None,
+                "score":           score(float(rating), int(reviews)),
                 "google_place_id": place_id or None,
-                "score": score(rating, review_count),
+                "google_maps_url": maps_url,
+                "status":          "scraped",
             })
-        except Exception as e:
-            print(f"    Error procesando card: {e}")
-            continue
+            time.sleep(0.1)  # respetar rate limit de Details API
+
+        # Siguiente página
+        next_token = data.get("next_page_token")
+        if not next_token or len(leads) >= limit:
+            break
+        time.sleep(2)  # Google requiere ~2s antes de usar el next_page_token
+        page_token = next_token
 
     return leads
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--niche", required=True, choices=list(SEARCH_TERMS.keys()))
-    parser.add_argument("--city", required=True)
-    parser.add_argument("--limit", type=int, default=30)
-    parser.add_argument("--headless", action="store_true", default=False)
-    args = parser.parse_args()
-
-    db = create_client(SUPABASE_URL, SUPABASE_KEY)
-    all_leads = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
-        page = browser.new_page()
-        page.set_extra_http_headers({"Accept-Language": "es-MX,es;q=0.9"})
-
-        for term in SEARCH_TERMS[args.niche]:
-            leads = scrape_google_maps(page, term, args.city, args.limit)
-            for lead in leads:
-                lead["niche"] = args.niche
-                lead["state"] = None
-            all_leads.extend(leads)
-            time.sleep(2)
-
-        browser.close()
-
-    # Deduplicar por nombre
-    seen = set()
-    unique = []
-    for lead in all_leads:
-        key = lead["business_name"].lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(lead)
-
-    print(f"\n✓ {len(unique)} leads únicos encontrados para {args.niche} en {args.city}")
-
-    # Insertar en Supabase (upsert por place_id si existe)
-    inserted = 0
-    skipped = 0
-    for lead in unique:
+def save_to_supabase(db, leads: list[dict]) -> tuple[int, int]:
+    inserted = skipped = 0
+    for lead in leads:
         try:
             if lead.get("google_place_id"):
-                res = db.table("leads").upsert(lead, on_conflict="google_place_id").execute()
+                db.table("leads").upsert(lead, on_conflict="google_place_id").execute()
             else:
-                # Sin place_id: insertar solo si no existe el nombre+ciudad
-                existing = db.table("leads").select("id") \
-                    .eq("business_name", lead["business_name"]) \
-                    .eq("city", lead["city"]).execute()
+                existing = (
+                    db.table("leads")
+                    .select("id")
+                    .eq("business_name", lead["business_name"])
+                    .eq("city", lead["city"])
+                    .execute()
+                )
                 if existing.data:
                     skipped += 1
                     continue
-                res = db.table("leads").insert(lead).execute()
+                db.table("leads").insert(lead).execute()
             inserted += 1
         except Exception as e:
-            print(f"  Error insertando {lead['business_name']}: {e}")
+            print(f"  ✗ Error guardando '{lead['business_name']}': {e}")
+    return inserted, skipped
 
-    print(f"✓ {inserted} leads guardados · {skipped} ya existían")
+
+def main():
+    parser = argparse.ArgumentParser(description="Turno Sales — Google Places Scraper")
+    parser.add_argument("--niche",  choices=list(SEARCH_TERMS.keys()), help="Nicho a scrapear")
+    parser.add_argument("--all",    action="store_true", help="Scrapear todos los nichos")
+    parser.add_argument("--city",   required=True, help="Ciudad objetivo (ej: 'Ciudad de México')")
+    parser.add_argument("--limit",  type=int, default=30, help="Máximo de leads por término de búsqueda")
+    args = parser.parse_args()
+
+    if not args.niche and not args.all:
+        parser.error("Especifica --niche o --all")
+
+    niches = list(SEARCH_TERMS.keys()) if args.all else [args.niche]
+    db = create_client(SUPABASE_URL, SUPABASE_KEY)
+    total_inserted = 0
+
+    for niche in niches:
+        print(f"\n── {niche.upper()} en {args.city} ──")
+        all_leads: list[dict] = []
+
+        for term in SEARCH_TERMS[niche]:
+            print(f"  Buscando: {term}...")
+            leads = fetch_leads(term, args.city, niche, args.limit)
+            all_leads.extend(leads)
+            print(f"  → {len(leads)} resultados")
+
+        # Deduplicar por place_id o nombre
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for lead in all_leads:
+            key = lead.get("google_place_id") or lead["business_name"].lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(lead)
+
+        print(f"  Únicos: {len(unique)}")
+        ins, skip = save_to_supabase(db, unique)
+        print(f"  ✓ {ins} guardados · {skip} ya existían")
+        total_inserted += ins
+
+    print(f"\n✅ Total guardados: {total_inserted}")
 
 
 if __name__ == "__main__":
