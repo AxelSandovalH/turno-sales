@@ -13,6 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { buildWhatsAppURL } from '@/lib/whatsapp'
+import { CallButton } from '@/components/call-button'
 import type { Lead, SalesActivity, LeadStatus, Niche } from '@/types/database'
 
 const STATUS_LABEL: Record<LeadStatus, string> = {
@@ -108,6 +109,15 @@ export function LeadDetail({ lead, activity }: { lead: Lead; activity: SalesActi
       {/* Acciones rápidas */}
       <div className="flex flex-wrap gap-2">
         {waPhone && (
+          <CallButton
+            phone={waPhone}
+            leadId={lead.id}
+            businessName={lead.business_name}
+            onCallStarted={() => updateStatus('contacted')}
+          />
+        )}
+
+        {waPhone && (
           <a
             href={buildWhatsAppURL(waPhone, lead.business_name, lead.niche)}
             target="_blank"
@@ -116,7 +126,7 @@ export function LeadDetail({ lead, activity }: { lead: Lead; activity: SalesActi
           >
             <Button size="sm" className="bg-emerald-600 hover:bg-emerald-500 text-white gap-2">
               <MessageCircle className="h-4 w-4" />
-              Abrir WhatsApp
+              WhatsApp
             </Button>
           </a>
         )}
